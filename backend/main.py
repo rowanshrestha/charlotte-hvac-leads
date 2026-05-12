@@ -2,11 +2,8 @@ import os
 import asyncio
 from datetime import datetime
 from contextlib import asynccontextmanager
-from dotenv import load_dotenv
 
-load_dotenv()
-
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
@@ -45,14 +42,21 @@ app.add_middleware(
 )
 
 
+async def run_notifications(lead_id: int, lead_data: dict):
+    try:
+        await notify_new_lead(lead_id, lead_data)
+    except Exception as e:
+        print(f"[Notifier error] {e}")
+    try:
+        await find_and_notify_contractors(lead_id, lead_data)
+    except Exception as e:
+        print(f"[Outreach error] {e}")
+
+
 @app.post("/api/leads")
-async def submit_lead(lead: LeadSubmission):
+async def submit_lead(lead: LeadSubmission, background_tasks: BackgroundTasks):
     lead_id = save_lead(lead.model_dump())
-
-    # Fire notifications concurrently — don't block the response
-    asyncio.create_task(notify_new_lead(lead_id, lead.model_dump()))
-    asyncio.create_task(find_and_notify_contractors(lead_id, lead.model_dump()))
-
+    background_tasks.add_task(run_notifications, lead_id, lead.model_dump())
     return {"status": "success", "lead_id": lead_id}
 
 
