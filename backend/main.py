@@ -60,6 +60,30 @@ async def submit_lead(lead: LeadSubmission, background_tasks: BackgroundTasks):
     return {"status": "success", "lead_id": lead_id}
 
 
+@app.get("/api/debug")
+async def debug_env():
+    return {
+        "telegram_token_set": bool(os.getenv("TELEGRAM_BOT_TOKEN")),
+        "telegram_chat_id_set": bool(os.getenv("TELEGRAM_CHAT_ID")),
+        "smtp_user_set": bool(os.getenv("SMTP_USER")),
+        "smtp_pass_set": bool(os.getenv("SMTP_PASS")),
+    }
+
+@app.post("/api/test-telegram")
+async def test_telegram():
+    import httpx
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID", "")
+    if not token or not chat_id:
+        return {"error": "Telegram not configured", "token_set": bool(token), "chat_set": bool(chat_id)}
+    async with httpx.AsyncClient() as client:
+        res = await client.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": chat_id, "text": "✅ Test from Railway — notifications are working!"},
+            timeout=10
+        )
+    return res.json()
+
 @app.get("/api/leads")
 async def list_leads():
     return {"leads": get_all_leads()}
