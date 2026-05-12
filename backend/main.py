@@ -12,6 +12,7 @@ from pydantic import BaseModel, EmailStr
 from database import init_db, save_lead, get_all_leads, get_leads_today
 from agents.notifier import notify_new_lead
 from agents.outreach import find_and_notify_contractors
+from agents.prospector import run_prospector, init_prospector_db
 
 
 class LeadSubmission(BaseModel):
@@ -29,6 +30,9 @@ class LeadSubmission(BaseModel):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    init_prospector_db()
+    # Run prospector once on startup to find + pitch contractors immediately
+    asyncio.create_task(run_prospector(max_emails=10))
     yield
 
 
@@ -59,6 +63,11 @@ async def submit_lead(lead: LeadSubmission, background_tasks: BackgroundTasks):
     background_tasks.add_task(run_notifications, lead_id, lead.model_dump())
     return {"status": "success", "lead_id": lead_id}
 
+
+@app.post("/api/prospect")
+async def trigger_prospector(background_tasks: BackgroundTasks):
+    background_tasks.add_task(run_prospector, 10)
+    return {"status": "Prospector running — will find and email contractors in background"}
 
 @app.get("/api/debug")
 async def debug_env():

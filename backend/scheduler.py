@@ -8,6 +8,7 @@ import asyncio
 from datetime import datetime, time as dt_time
 
 from agents.reporter import send_daily_report
+from agents.prospector import run_prospector
 
 REPORT_HOUR = 20    # 8 PM
 REPORT_MINUTE = 0
@@ -27,8 +28,9 @@ async def run_scheduler():
         print(f"[Scheduler] Next report in {wait_seconds/3600:.1f} hours")
         await asyncio.sleep(wait_seconds)
 
-        print("[Scheduler] Firing daily report...")
+        print("[Scheduler] Firing daily report + prospecting...")
         await send_daily_report()
+        await run_prospector(max_emails=15)
         await asyncio.sleep(60)  # Prevent double-fire
 
 
