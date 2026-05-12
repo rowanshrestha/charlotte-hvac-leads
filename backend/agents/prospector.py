@@ -7,27 +7,34 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 SMTP_USER = os.getenv("SMTP_USER", "")
 SMTP_PASS = os.getenv("SMTP_PASS", "")
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
-GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY", "")
 
 DB_PATH = Path(__file__).parent.parent / "leads.db"
 
-YELP_SEARCHES = [
-    "https://www.yelp.com/search?find_desc=HVAC&find_loc=Charlotte%2C+NC",
-    "https://www.yelp.com/search?find_desc=Air+Conditioning+Repair&find_loc=Charlotte%2C+NC",
-    "https://www.yelp.com/search?find_desc=Heating+Cooling&find_loc=Charlotte%2C+NC",
-    "https://www.yelp.com/search?find_desc=Furnace+Repair&find_loc=Charlotte%2C+NC",
+SEARCH_QUERIES = [
+    '"Charlotte NC" HVAC contractor company email',
+    '"Charlotte NC" air conditioning heating contractor contact',
+    '"Charlotte North Carolina" HVAC repair company email',
+    '"Charlotte NC" furnace AC repair contractor',
+    '"Charlotte NC" heating cooling company site:*.com',
 ]
 
 EMAIL_REGEX = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
-WEBSITE_REGEX = re.compile(r'href="(https?://(?!.*yelp\.com)[^"]+)"[^>]*>(?:Business Website|website|Visit Website)', re.IGNORECASE)
-SKIP_DOMAINS = {"example.com", "sentry.io", "wix.com", "squarespace.com",
-                "wordpress.com", "google.com", "yelp.com", "facebook.com",
-                "instagram.com", "twitter.com", "linkedin.com", "bbb.org"}
+SKIP_DOMAINS = {
+    "example.com", "sentry.io", "wix.com", "squarespace.com",
+    "wordpress.com", "google.com", "yelp.com", "facebook.com",
+    "instagram.com", "twitter.com", "linkedin.com", "bbb.org",
+    "duckduckgo.com", "yahoo.com", "bing.com", "adobe.com",
+    "w3.org", "jquery.com", "cloudflare.com", "amazonaws.com",
+    "gmail.com", "hotmail.com", "outlook.com", "icloud.com",
+    "angi.com", "homeadvisor.com", "thumbtack.com", "houzz.com",
+}
+SKIP_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".pdf"}
 
 
 def init_prospector_db():
@@ -81,76 +88,88 @@ def mark_emailed(email: str):
         conn.commit()
 
 
-async def find_contractors_yelp(url: str, client: httpx.AsyncClient) -> list[dict]:
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept-Language": "en-US,en;q=0.9",
-    }
+def search_contractors_ddgs(query: str, seen_domains: set) -> list[dict]:
+    try:
+        from ddgs import DDGS
+    except ImportError:
+        try:
+            from duckduckgo_search import DDGS
+        except ImportError:
+            print("[Prospector] ddgs not installed")
+            return []
+
     contractors = []
     try:
-        res = await client.get(url, headers=headers, timeout=15, follow_redirects=True)
-        html = res.text
-
-        # Extract business links from Yelp search results
-        biz_links = re.findall(r'href="(/biz/[a-z0-9\-]+)"', html)
-        biz_links = list(dict.fromkeys(biz_links))[:10]  # dedupe, take first 10
-
-        for biz_path in biz_links:
-            try:
-                biz_url = f"https://www.yelp.com{biz_path}"
-                biz_res = await client.get(biz_url, headers=headers, timeout=10, follow_redirects=True)
-                biz_html = biz_res.text
-
-                # Extract business name
-                name_match = re.search(r'<h1[^>]*>([^<]+)</h1>', biz_html)
-                name = name_match.group(1).strip() if name_match else ""
-
-                # Extract website URL from Yelp page
-                website_match = re.search(r'"website"[^>]*href="(https?://[^"]+)"', biz_html)
-                if not website_match:
-                    website_match = re.search(r'href="(https?://(?!.*yelp)[^"]+)"[^>]*>(?:Business Website|Visit Website)', biz_html, re.IGNORECASE)
-
-                website = website_match.group(1) if website_match else ""
-
-                if name:
-                    contractors.append({
-                        "name": name,
-                        "website": website,
-                        "phone": "",
-                        "source": "yelp"
-                    })
-                    print(f"[Prospector] Found on Yelp: {name} — {website or 'no website'}")
-            except Exception:
+        results = DDGS().text(query, max_results=15)
+        for r in results:
+            href = r.get("href", "")
+            title = r.get("title", "")
+            if not href:
                 continue
 
+            parsed = urlparse(href)
+            domain = parsed.netloc.lower().replace("www.", "")
+            if not domain or domain in SKIP_DOMAINS:
+                continue
+            if any(skip in domain for skip in SKIP_DOMAINS):
+                continue
+            if domain in seen_domains:
+                continue
+
+            seen_domains.add(domain)
+            contractors.append({
+                "name": title,
+                "website": f"{parsed.scheme}://{parsed.netloc}",
+                "source": "ddgs"
+            })
+            print(f"[Prospector] Found: {title[:50]} — {parsed.netloc}")
+
     except Exception as e:
-        print(f"[Prospector] Yelp scrape error: {e}")
+        print(f"[Prospector] DDGS search error: {e}")
 
     return contractors
+
+
+def _clean_email(email: str) -> str | None:
+    email = email.lower().strip()
+    domain = email.split("@")[-1]
+    if domain in SKIP_DOMAINS:
+        return None
+    if any(email.endswith(ext) for ext in SKIP_EXTENSIONS):
+        return None
+    if len(email) > 100 or len(email) < 6:
+        return None
+    # Skip obviously auto-generated or no-reply emails
+    local = email.split("@")[0]
+    if any(x in local for x in ["noreply", "no-reply", "donotreply", "info@info"]):
+        return None
+    return email
 
 
 async def scrape_email_from_website(url: str, client: httpx.AsyncClient) -> str:
     if not url:
         return ""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
     try:
-        headers = {"User-Agent": "Mozilla/5.0 (compatible; LeadBot/1.0)"}
-        res = await client.get(url, headers=headers, timeout=8, follow_redirects=True)
+        res = await client.get(url, headers=headers, timeout=10, follow_redirects=True)
         emails = EMAIL_REGEX.findall(res.text)
         for email in emails:
-            domain = email.split("@")[1].lower()
-            if domain not in SKIP_DOMAINS and not domain.endswith(".png") and not domain.endswith(".jpg"):
-                return email.lower()
+            cleaned = _clean_email(email)
+            if cleaned:
+                return cleaned
 
-        # Also try /contact page
         base = url.rstrip("/")
-        for path in ["/contact", "/contact-us", "/about"]:
+        for path in ["/contact", "/contact-us", "/about", "/about-us"]:
             try:
-                res2 = await client.get(base + path, headers=headers, timeout=6, follow_redirects=True)
+                res2 = await client.get(base + path, headers=headers, timeout=8, follow_redirects=True)
                 emails2 = EMAIL_REGEX.findall(res2.text)
                 for email in emails2:
-                    domain = email.split("@")[1].lower()
-                    if domain not in SKIP_DOMAINS:
-                        return email.lower()
+                    cleaned = _clean_email(email)
+                    if cleaned:
+                        return cleaned
             except Exception:
                 continue
     except Exception as e:
@@ -160,7 +179,8 @@ async def scrape_email_from_website(url: str, client: httpx.AsyncClient) -> str:
 
 def build_pitch_email(contractor_name: str) -> tuple[str, str]:
     subject = "Charlotte homeowners are requesting HVAC quotes — interested?"
-    name = contractor_name.split()[0] if contractor_name else "there"
+    name = re.sub(r"<[^>]+>", "", contractor_name or "").strip()
+    name = name.split()[0] if name else "there"
 
     html = f"""
     <div style="font-family:Arial,sans-serif;max-width:580px;margin:0 auto;padding:20px;color:#1a1a2e">
@@ -171,8 +191,8 @@ def build_pitch_email(contractor_name: str) -> tuple[str, str]:
 
       <p>Right now I have homeowners in the Charlotte area actively requesting quotes for:</p>
       <ul>
-        <li>AC repair & installation</li>
-        <li>Heating repair & replacement</li>
+        <li>AC repair &amp; installation</li>
+        <li>Heating repair &amp; replacement</li>
         <li>Emergency HVAC service</li>
       </ul>
 
@@ -207,7 +227,7 @@ def build_pitch_email(contractor_name: str) -> tuple[str, str]:
 
 async def send_pitch_email(contractor: dict) -> bool:
     if not SMTP_USER or not SMTP_PASS:
-        print(f"[Prospector] SMTP not configured — would email {contractor['email']}")
+        print(f"[Prospector] SMTP not configured — skipping {contractor['email']}")
         return False
 
     subject, html = build_pitch_email(contractor.get("name", ""))
@@ -225,26 +245,31 @@ async def send_pitch_email(contractor: dict) -> bool:
             server.sendmail(SMTP_USER, contractor["email"], msg.as_string())
 
         mark_emailed(contractor["email"])
-        print(f"[Prospector] Pitched {contractor['name']} at {contractor['email']}")
+        print(f"[Prospector] ✅ Pitched {contractor['name']} at {contractor['email']}")
         return True
     except Exception as e:
-        print(f"[Prospector] Email error to {contractor['email']}: {e}")
+        print(f"[Prospector] ❌ Email error to {contractor['email']}: {e}")
         return False
 
 
 async def run_prospector(max_emails: int = 10):
     init_prospector_db()
-    print(f"[Prospector] Starting — will find and pitch up to {max_emails} contractors")
+    print(f"[Prospector] Starting — targeting up to {max_emails} contractors")
 
+    # Step 1: Find contractor websites via DDGS
+    seen_domains: set = set()
+    all_contractors: list[dict] = []
+
+    for query in SEARCH_QUERIES:
+        results = search_contractors_ddgs(query, seen_domains)
+        all_contractors.extend(results)
+        if len(all_contractors) >= max_emails * 3:
+            break
+
+    print(f"[Prospector] Found {len(all_contractors)} unique contractor sites to check")
+
+    # Step 2: Scrape emails from their websites
     async with httpx.AsyncClient() as client:
-        # Step 1: Find contractors via Yelp
-        all_contractors = []
-        for url in YELP_SEARCHES:
-            results = await find_contractors_yelp(url, client)
-            all_contractors.extend(results)
-            print(f"[Prospector] Found {len(results)} contractors from Yelp search")
-
-        # Step 2: Scrape emails from their websites
         found = 0
         for c in all_contractors:
             if found >= max_emails * 2:
@@ -255,12 +280,11 @@ async def run_prospector(max_emails: int = 10):
                     name=c["name"],
                     email=email,
                     website=c.get("website", ""),
-                    phone=c.get("phone", ""),
-                    source=c.get("source", "")
+                    source=c.get("source", "ddgs")
                 )
                 if saved:
                     found += 1
-                    print(f"[Prospector] Found email: {c['name']} → {email}")
+                    print(f"[Prospector] ✅ Email found: {c['name']} → {email}")
 
         print(f"[Prospector] Scraped {found} contractor emails")
 
@@ -272,8 +296,8 @@ async def run_prospector(max_emails: int = 10):
             if success:
                 sent += 1
 
-        print(f"[Prospector] Done — pitched {sent} contractors")
-        return {"found": found, "emailed": sent}
+    print(f"[Prospector] Done — pitched {sent} contractors")
+    return {"found": found, "emailed": sent}
 
 
 if __name__ == "__main__":
