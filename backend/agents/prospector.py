@@ -16,17 +16,18 @@ GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY", "")
 
 DB_PATH = Path(__file__).parent.parent / "leads.db"
 
-SEARCH_QUERIES = [
-    "HVAC contractor Charlotte NC",
-    "air conditioning repair Charlotte NC",
-    "heating and cooling Charlotte NC",
-    "AC installation Charlotte North Carolina",
-    "furnace repair Charlotte NC",
+YELP_SEARCHES = [
+    "https://www.yelp.com/search?find_desc=HVAC&find_loc=Charlotte%2C+NC",
+    "https://www.yelp.com/search?find_desc=Air+Conditioning+Repair&find_loc=Charlotte%2C+NC",
+    "https://www.yelp.com/search?find_desc=Heating+Cooling&find_loc=Charlotte%2C+NC",
+    "https://www.yelp.com/search?find_desc=Furnace+Repair&find_loc=Charlotte%2C+NC",
 ]
 
 EMAIL_REGEX = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
+WEBSITE_REGEX = re.compile(r'href="(https?://(?!.*yelp\.com)[^"]+)"[^>]*>(?:Business Website|website|Visit Website)', re.IGNORECASE)
 SKIP_DOMAINS = {"example.com", "sentry.io", "wix.com", "squarespace.com",
-                "wordpress.com", "google.com", "yelp.com", "facebook.com"}
+                "wordpress.com", "google.com", "yelp.com", "facebook.com",
+                "instagram.com", "twitter.com", "linkedin.com", "bbb.org"}
 
 
 def init_prospector_db():
@@ -80,38 +81,52 @@ def mark_emailed(email: str):
         conn.commit()
 
 
-async def find_contractors_google(query: str, client: httpx.AsyncClient) -> list[dict]:
-    if not GOOGLE_PLACES_API_KEY:
-        return []
+async def find_contractors_yelp(url: str, client: httpx.AsyncClient) -> list[dict]:
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+    contractors = []
     try:
-        res = await client.get(
-            "https://maps.googleapis.com/maps/api/place/textsearch/json",
-            params={"query": query, "key": GOOGLE_PLACES_API_KEY},
-            timeout=10
-        )
-        places = res.json().get("results", [])[:8]
-        contractors = []
-        for place in places:
-            detail_res = await client.get(
-                "https://maps.googleapis.com/maps/api/place/details/json",
-                params={
-                    "place_id": place["place_id"],
-                    "fields": "name,formatted_phone_number,website",
-                    "key": GOOGLE_PLACES_API_KEY
-                },
-                timeout=10
-            )
-            detail = detail_res.json().get("result", {})
-            contractors.append({
-                "name": place.get("name", ""),
-                "phone": detail.get("formatted_phone_number", ""),
-                "website": detail.get("website", ""),
-                "source": "google_places"
-            })
-        return contractors
+        res = await client.get(url, headers=headers, timeout=15, follow_redirects=True)
+        html = res.text
+
+        # Extract business links from Yelp search results
+        biz_links = re.findall(r'href="(/biz/[a-z0-9\-]+)"', html)
+        biz_links = list(dict.fromkeys(biz_links))[:10]  # dedupe, take first 10
+
+        for biz_path in biz_links:
+            try:
+                biz_url = f"https://www.yelp.com{biz_path}"
+                biz_res = await client.get(biz_url, headers=headers, timeout=10, follow_redirects=True)
+                biz_html = biz_res.text
+
+                # Extract business name
+                name_match = re.search(r'<h1[^>]*>([^<]+)</h1>', biz_html)
+                name = name_match.group(1).strip() if name_match else ""
+
+                # Extract website URL from Yelp page
+                website_match = re.search(r'"website"[^>]*href="(https?://[^"]+)"', biz_html)
+                if not website_match:
+                    website_match = re.search(r'href="(https?://(?!.*yelp)[^"]+)"[^>]*>(?:Business Website|Visit Website)', biz_html, re.IGNORECASE)
+
+                website = website_match.group(1) if website_match else ""
+
+                if name:
+                    contractors.append({
+                        "name": name,
+                        "website": website,
+                        "phone": "",
+                        "source": "yelp"
+                    })
+                    print(f"[Prospector] Found on Yelp: {name} — {website or 'no website'}")
+            except Exception:
+                continue
+
     except Exception as e:
-        print(f"[Prospector] Google Places error: {e}")
-        return []
+        print(f"[Prospector] Yelp scrape error: {e}")
+
+    return contractors
 
 
 async def scrape_email_from_website(url: str, client: httpx.AsyncClient) -> str:
@@ -222,12 +237,12 @@ async def run_prospector(max_emails: int = 10):
     print(f"[Prospector] Starting — will find and pitch up to {max_emails} contractors")
 
     async with httpx.AsyncClient() as client:
-        # Step 1: Find contractors via Google Places
+        # Step 1: Find contractors via Yelp
         all_contractors = []
-        for query in SEARCH_QUERIES:
-            results = await find_contractors_google(query, client)
+        for url in YELP_SEARCHES:
+            results = await find_contractors_yelp(url, client)
             all_contractors.extend(results)
-            print(f"[Prospector] Found {len(results)} from: {query}")
+            print(f"[Prospector] Found {len(results)} contractors from Yelp search")
 
         # Step 2: Scrape emails from their websites
         found = 0
