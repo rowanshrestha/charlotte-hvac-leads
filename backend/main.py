@@ -27,12 +27,17 @@ class LeadSubmission(BaseModel):
     state: str = "NC"
 
 
+async def _safe_prospector():
+    try:
+        await run_prospector(max_emails=10)
+    except Exception as e:
+        print(f"[Startup prospector error] {e}")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
     init_prospector_db()
-    # Run prospector once on startup to find + pitch contractors immediately
-    asyncio.create_task(run_prospector(max_emails=10))
+    asyncio.create_task(_safe_prospector())
     yield
 
 

@@ -90,17 +90,17 @@ def mark_emailed(email: str):
 
 def search_contractors_ddgs(query: str, seen_domains: set) -> list[dict]:
     try:
-        from ddgs import DDGS
-    except ImportError:
         try:
-            from duckduckgo_search import DDGS
+            from ddgs import DDGS
         except ImportError:
-            print("[Prospector] ddgs not installed")
-            return []
+            from duckduckgo_search import DDGS
+    except ImportError:
+        print("[Prospector] ddgs not installed")
+        return []
 
     contractors = []
     try:
-        results = DDGS().text(query, max_results=15)
+        results = list(DDGS().text(query, max_results=15))
         for r in results:
             href = r.get("href", "")
             title = r.get("title", "")
@@ -256,12 +256,17 @@ async def run_prospector(max_emails: int = 10):
     init_prospector_db()
     print(f"[Prospector] Starting — targeting up to {max_emails} contractors")
 
-    # Step 1: Find contractor websites via DDGS
+    import asyncio
+    loop = asyncio.get_event_loop()
+
+    # Step 1: Find contractor websites via DDGS (blocking — run in thread)
     seen_domains: set = set()
     all_contractors: list[dict] = []
 
     for query in SEARCH_QUERIES:
-        results = search_contractors_ddgs(query, seen_domains)
+        results = await loop.run_in_executor(
+            None, search_contractors_ddgs, query, seen_domains
+        )
         all_contractors.extend(results)
         if len(all_contractors) >= max_emails * 3:
             break
